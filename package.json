@@ -2,33 +2,23 @@
   "name": "config-3d-process",
   "version": "1.0.0",
   "description": "",
-  "main": "app.js",
+  "main": "lib/processQueue.js",
   "scripts": {
-    "dev": "concurrently --kill-others \"npm run start-realtime\" \"npm run start-process\"",
-    "start": "concurrently --kill-others \"npm run start-realtime\" \"npm run start-process\"",
-    "start-process": "node lib/process.js",
-    "start-realtime": "node lib/realtime.js",
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "local:start": "fastify start -l info app.js",
-    "local:dev": "fastify start -w --ignore-watch 'tmp' -l info -d -I 9222 -P app.js --port 3002"
+    "dev": "node lib/processQueue.js",
+    "start": "node lib/processQueue.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@fastify/cors": "^8.1.1",
-    "@fastify/multipart": "^7.3.0",
     "@supabase/supabase-js": "^2.43.2",
     "amqplib": "^0.10.3",
-    "async": "^3.2.4",
-    "aws-sdk": "^2.1249.0",
-    "fastify": "^4.9.2",
-    "fastify-plugin": "^4.3.0",
     "fastq": "^1.15.0",
     "mime-types": "^2.1.35",
+    "path": "^0.12.7",
     "telegraf": "^4.16.3",
-    "undici": "^6.10.1",
-    "uuid": "^9.0.0"
+    "undici": "^6.10.1"
   },
   "devDependencies": {
     "concurrently": "^8.2.2",
