@@ -3,7 +3,8 @@ const {
   PutObjectCommand,
   DeleteObjectCommand,
 } = require("@aws-sdk/client-s3");
-const { clientS3 } = require("./s3Client");
+
+const clientS3 = require('./s3Client')
 
 const getObject = async (Bucket, Key) => {
   const response = await clientS3.send(new GetObjectCommand({ Bucket, Key }));

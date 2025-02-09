@@ -17,4 +17,4 @@ const s3ClientConfig = {
 
 const clientS3 = new S3Client(s3ClientConfig);
 
-module.exports = { clientS3 };
+module.exports = clientS3 ;

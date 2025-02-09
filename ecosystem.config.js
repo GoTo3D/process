@@ -2,7 +2,7 @@ module.exports = {
   apps: [
     {
       name: "PROCESS",
-      script: "./lib/processQueue.js"
+      script: "./src/processQueue.js"
     }
   ]
 }
