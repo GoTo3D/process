@@ -1,6 +1,7 @@
-// const { readdir, stat, readFile } = require('fs/promises')
-// const path = require('path')
-// const mime = require('mime-types')
+const fs = require('fs')
+const { readdir, stat, readFile } = require('fs/promises')
+const path = require('path')
+const mime = require('mime-types')
 const dotenv = require("dotenv");
 const { getObject, deleteObject, putObject } = require("../lib/s3Api");
 const { request } = require('undici')
@@ -8,25 +9,25 @@ const { request } = require('undici')
 dotenv.config();
 const BUCKET = process.env.BUCKET;
 
-// const walk = async (currentDirPath, callback) => {
-//   const ret = []
-//   const files = await readdir(currentDirPath)
-//   for await (const file of files) {
-//     const filepath = path.join(currentDirPath, file)
-//     const _stat = await stat(filepath)
-//     const _path = path.extname(file);
-//     console.log(_path)
-//     if (_stat.isFile())
-//       ret.push({
-//         file: readFile(filepath),
-//         filename: file,
-//         contentType: mime.lookup(_path),
-//         path: filepath.substring(currentDirPath.length + 1),
-//       })
-//     else if (_stat.isDirectory()) ret.push(...(await walk(filepath, callback)))
-//   }
-//   return ret
-// }
+const walk = async (currentDirPath, callback) => {
+  const ret = []
+  const files = await readdir(currentDirPath)
+  for await (const file of files) {
+    const filepath = path.join(currentDirPath, file)
+    const _stat = await stat(filepath)
+    const _path = path.extname(file);
+    console.log(_path)
+    if (_stat.isFile())
+      ret.push({
+        file: readFile(filepath),
+        filename: file,
+        contentType: mime.lookup(_path),
+        path: filepath.substring(currentDirPath.length + 1),
+      })
+    else if (_stat.isDirectory()) ret.push(...(await walk(filepath, callback)))
+  }
+  return ret
+}
 
 /* Private - upload files to supabase */
 const _uploadDir = async ({ file_location, bucket_location }) => {

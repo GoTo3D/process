@@ -48,9 +48,12 @@ class ProcessManager {
     //   .from("project")
     //   .update(updateObj)
     //   .eq("id", parseInt(this.id));
-    updateProject(parseInt(this.id), updateObj)
-    
-    if (error) throw error;
+    try {
+      updateProject(parseInt(this.id), updateObj)
+    } catch (error) {
+      console.error(`Error updating project for ID: ${this.id}:`, error);
+      throw error;
+    }
   }
 
   /**
@@ -64,7 +67,21 @@ class ProcessManager {
     if (this.isTelegram) {
       await downloadFromTelegram(this.imgDir, files);
     } else {
-      await downloadFiles(`${this.id}`, files);
+      try {
+        await downloadFiles(`${this.id}`, files);
+      } catch (error) {
+        console.error(`Errore durante il download dei file per il progetto ${this.id}:`, error);
+        // Verifica se la cartella delle immagini esiste e contiene file
+        try {
+          const imageFiles = await fs.promises.readdir(this.imgDir);
+          if (imageFiles.length === 0) {
+            throw new Error('Nessuna immagine scaricata correttamente');
+          }
+          console.warn(`Download parzialmente completato con ${imageFiles.length} file`);
+        } catch (e) {
+          throw new Error(`Download fallito completamente: ${error.message}`);
+        }
+      }
     }
   }
 
@@ -76,7 +93,10 @@ class ProcessManager {
     const _outDir = path.join(__dirname, "..", this.outDir);
     const _imgDir = path.join(__dirname, "..", this.imgDir);
     
-    const command = `cd ${libDir} && ./HelloPhotogrammetry ${_imgDir} ${_outDir}model.usdz -d ${this.project.detail} -o ${this.project.ordering} -f ${this.project.feature}`;
+    // Impostiamo un valore predefinito per ordering se è undefined
+    const ordering = this.project.ordering || 'unordered';
+    
+    const command = `cd ${libDir} && ./HelloPhotogrammetry ${_imgDir} ${_outDir}model.usdz -d ${this.project.detail} -o ${ordering} -f ${this.project.feature}`;
     
     await new Promise((res, rej) =>
       exec(command, (error) => {
@@ -222,11 +242,13 @@ class ProcessManager {
     //   .select("*")
     //   .eq("id", id)
     //   .single();
-
-    const project = await getProject(id)
-
-    if (error) throw error;
-    return new ProcessManager(id, project);
+    try {
+      const project = await getProject(id)
+      return new ProcessManager(id, project);
+    } catch (error) {
+      console.error(`Error creating ProcessManager for ID: ${id}:`, error);
+      throw error;
+    }
   }
 }
 

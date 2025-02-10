@@ -5,7 +5,7 @@ const dotenv = require("dotenv");
 dotenv.config();
 
 const QUEUE_CONNECTION_STRING = process.env.QUEUE_CONNECTION_STRING;
-const QUEUE = process.env.QUEUE_CONNECTION_STRING || "processing-dev"
+const QUEUE = process.env.QUEUE || "processing-dev"
 
 /**
  * Gestisce un singolo processo dalla coda
@@ -34,7 +34,6 @@ amqp.connect(
     connection.createChannel(function (channelError, channel) {
       if (channelError) throw channelError;
       console.log("[OK] Channel created!")
-
       channel.assertQueue(QUEUE, { durable: true });
 
       console.log(" [*] Waiting for messages in %s. To exit press CTRL+C");
