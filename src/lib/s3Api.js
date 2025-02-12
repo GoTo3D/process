@@ -11,6 +11,10 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const getObject = async (Bucket, Key, retries = 3) => {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
+
+      // const { data: dataFiles, error: errorFiles } = await supabase.storage
+      //   .from(BUCKET)
+      //   .download(location);
       const response = await clientS3.send(new GetObjectCommand({ Bucket, Key }));
       
       // Convertiamo lo stream in buffer
@@ -37,6 +41,13 @@ const getObject = async (Bucket, Key, retries = 3) => {
 };
 
 const putObject = async (Bucket, Key, Body) => {
+
+  // const { data, error } = await supabase.storage
+  //   .from(BUCKET)
+  //   .upload(location, await file, {
+  //     contentType,
+  //   });
+
   const response = await clientS3.send(
     new PutObjectCommand({ Bucket, Key, Body }),
   );
@@ -44,6 +55,7 @@ const putObject = async (Bucket, Key, Body) => {
 };
 
 const deleteObject = async (Bucket, Key) => {
+  // await supabase.storage.from(BUCKET).remove([location]);
   const response = await clientS3.send(
     new DeleteObjectCommand({ Bucket, Key }),
   );

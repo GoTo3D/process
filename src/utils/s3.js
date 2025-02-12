@@ -40,12 +40,6 @@ const _uploadDir = async ({ file_location, bucket_location }) => {
     console.log("Uploading file: " + filename);
     const location = `${bucket_location}/model/${filename}`;
 
-    // const { data, error } = await supabase.storage
-    //   .from(BUCKET)
-    //   .upload(location, await file, {
-    //     contentType,
-    //   });
-
     await putObject(BUCKET, location, await file);
     ret.push(location);
   }
@@ -56,24 +50,20 @@ const _uploadDir = async ({ file_location, bucket_location }) => {
 
 
 /* Private - download files from supabase */
-const _downloadFiles = async (id, files) => {
+const _downloadFiles = async (id, files, imgDir) => {
   try {
-    const locationPath = `projects/${id}`;
-    const localImageLocation = `${locationPath}/images/`;
     // create the projects/id/images folder if it doesn't exist
-    await fs.promises.mkdir(localImageLocation, { recursive: true });
+    await fs.promises.mkdir(imgDir, { recursive: true });
 
     // loop through all files to download them
     for (let i = 0; i < files.length; i++) {
       const file_name = files[i];
       const location = `${id}/images/${file_name}`;
-      const localLocation = `${localImageLocation}${file_name}`;
+      
+      const localLocation = `${imgDir}${file_name}`;
 
       // download the file from supabase
       console.log("Downloading", location);
-      // const { data: dataFiles, error: errorFiles } = await supabase.storage
-      //   .from(BUCKET)
-      //   .download(location);
       const get = await getObject(BUCKET, location);
 
       if (!get) {
@@ -87,7 +77,6 @@ const _downloadFiles = async (id, files) => {
         console.error(e);
       }
       // delete the file from supabase
-      // await supabase.storage.from(BUCKET).remove([location]);
       await deleteObject(BUCKET, location);
     }
   } catch (error) {
