@@ -4,8 +4,8 @@
   "description": "",
   "main": "lib/processQueue.js",
   "scripts": {
-    "dev": "node lib/processQueue.js",
-    "start": "node lib/processQueue.js",
+    "dev": "node src/processQueue.js",
+    "start": "node src/processQueue.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
