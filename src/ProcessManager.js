@@ -9,19 +9,41 @@ const { sendMessage, sendDocument } = require("./utils/telegram");
 dotenv.config();
 
 const time = (who) => {
- return {
+  return {
     start: () => {
       console.time(`[${who}]`);
     },
     end: () => {
       console.timeEnd(`[${who}]`);
     }
- } 
+  }
 }
+
+// Whitelist per parametri HelloPhotogrammetry (previene Command Injection)
+const ALLOWED_DETAILS = ['preview', 'reduced', 'medium', 'full', 'raw'];
+const ALLOWED_ORDERINGS = ['unordered', 'sequential'];
+const ALLOWED_FEATURES = ['normal', 'high'];
+
+/**
+ * Valida e sanitizza un parametro contro una whitelist
+ * @param {string} value - Valore da validare
+ * @param {string[]} allowedValues - Valori permessi
+ * @param {string} defaultValue - Valore di default se non valido
+ * @returns {string} Valore validato
+ */
+const sanitizeParam = (value, allowedValues, defaultValue) => {
+  if (typeof value !== 'string') return defaultValue;
+  const normalized = value.toLowerCase().trim();
+  return allowedValues.includes(normalized) ? normalized : defaultValue;
+};
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 
 const libDir = path.join(__dirname, "..", "src", "lib");
+
+// Timeout per i comandi exec (30 minuti per photogrammetry, 5 minuti per conversione)
+const PHOTOGRAMMETRY_TIMEOUT = 30 * 60 * 1000;
+const CONVERSION_TIMEOUT = 5 * 60 * 1000;
 
 /**
  * Gestisce il processo di elaborazione di un progetto 3D
@@ -54,7 +76,7 @@ class ProcessManager {
     };
 
     try {
-      updateProject(parseInt(this.id), updateObj)
+      await updateProject(parseInt(this.id), updateObj)
     } catch (error) {
       console.error(`Error updating project for ID: ${this.id}:`, error);
       throw error;
@@ -63,12 +85,24 @@ class ProcessManager {
 
   /**
    * Scarica i file del progetto da Telegram o dal storage
+   * Se i file esistono già localmente, salta il download
    * @throws {Error} Se non ci sono file da processare
    */
   async downloadProjectFiles() {
     const { files } = this.project;
     if (!files || files.length === 0) throw new Error("No files to process");
-    
+
+    // Verifica se i file esistono già localmente (utile per test con --local)
+    try {
+      const localFiles = await fs.promises.readdir(this.imgDir);
+      if (localFiles.length > 0) {
+        console.log(`Found ${localFiles.length} local files, skipping download`);
+        return;
+      }
+    } catch (e) {
+      // Directory non esiste ancora, procedi con il download
+    }
+
     if (this.isTelegram) {
       await downloadFromTelegram(this.imgDir, files);
     } else {
@@ -98,28 +132,37 @@ class ProcessManager {
   async processModel() {
     const _outDir = this.outDir;
     const _imgDir = this.imgDir;
-    
-    // Impostiamo un valore predefinito per ordering se è undefined
-    const ordering = this.project.ordering || 'unordered';
-    
-    const command = `cd ${libDir} && ./HelloPhotogrammetry ${_imgDir} ${_outDir}model.usdz -d ${this.project.detail} -o ${ordering} -f ${this.project.feature}`;
-    
+
+    // Sanitizza i parametri per prevenire Command Injection
+    // Nota: la colonna nel DB si chiama 'order', non 'ordering'
+    const detail = sanitizeParam(this.project.detail, ALLOWED_DETAILS, 'medium');
+    const ordering = sanitizeParam(this.project.order, ALLOWED_ORDERINGS, 'unordered');
+    const feature = sanitizeParam(this.project.feature, ALLOWED_FEATURES, 'normal');
+
+    const command = `cd ${libDir} && ./HelloPhotogrammetry ${_imgDir} ${_outDir}model.usdz -d ${detail} -o ${ordering} -f ${feature}`;
+
     console.log(`Executing command: ${command}`);
-    
-    return new Promise((res, rej) =>
-      exec(command, (error, stdout, stderr) => {
+
+    return new Promise((res, rej) => {
+      const childProcess = exec(command, { timeout: PHOTOGRAMMETRY_TIMEOUT }, (error, stdout, stderr) => {
         console.log(`stdout: ${stdout}`);
         if (error) {
           console.error(`stderr: ${stderr}`);
-          rej(error);
+          if (error.killed) {
+            rej(new Error(`Process killed due to timeout (${PHOTOGRAMMETRY_TIMEOUT}ms)`));
+          } else {
+            rej(error);
+          }
           return;
         }
         fs.promises
           .access(`${_outDir}model.usdz`)
           .then(() => res("ok"))
-          .catch(() => rej("File not found"));
-      })
-    );
+          .catch(() => rej(new Error("Output file not found")));
+      });
+
+      childProcess.on('error', (err) => rej(err));
+    });
   }
 
   /**
@@ -127,18 +170,24 @@ class ProcessManager {
    * @returns {Promise<string>} 'ok' se la conversione ha successo
    */
   async convertModel() {
-    // const _modelDir = path.join(__dirname, "..", this.outDir);
     const _modelDir = this.outDir;
-    return new Promise((res, rej) =>
-      exec(`cd ${libDir} && ./usdconv ${_modelDir}model.usdz`, (error) => {
+    const command = `cd ${libDir} && ./usdconv ${_modelDir}model.usdz`;
+
+    return new Promise((res, rej) => {
+      const childProcess = exec(command, { timeout: CONVERSION_TIMEOUT }, (error) => {
         if (error) {
-          console.log(error);
-          res(error);
+          if (error.killed) {
+            rej(new Error(`Conversion killed due to timeout (${CONVERSION_TIMEOUT}ms)`));
+          } else {
+            rej(error);
+          }
           return;
         }
         res("ok");
-      })
-    );
+      });
+
+      childProcess.on('error', (err) => rej(err));
+    });
   }
 
   /**
@@ -148,15 +197,14 @@ class ProcessManager {
   async notifyTelegram() {
     if (!this.isTelegram) return;
 
-    const data = await getTelegramUser(this.project.telegram_user)
-    if (error) throw error;
+    const data = await getTelegramUser(this.project.telegram_user);
 
-    sendMessage(data.user_id, `Processing done for process ${this.id}`)
+    sendMessage(data.user_id, `Processing done for process ${this.id}`);
 
-    sendMessage(data.user_id, `You can download the model from this link: ${SUPABASE_URL}/viewer/${this.id}`)
-    
-    const source = path.join(__dirname, "..", this.id, "model.usdz");
-    await sendDocument(data.user_id, source)
+    sendMessage(data.user_id, `You can download the model from this link: ${SUPABASE_URL}/viewer/${this.id}`);
+
+    const source = path.join(this.outDir, "model.usdz");
+    await sendDocument(data.user_id, source);
   }
 
   /**
@@ -256,7 +304,7 @@ class ProcessManager {
       console.log(`Uploaded to S3 for ID: ${this.id}`);
 
       // Notify Telegram if needed
-      if(this.isTelegram) {
+      if (this.isTelegram) {
         console.log(`Notifying Telegram for ID: ${this.id}`);
         timeIdentify = `${this.id}_notifyTelegram`
         time(timeIdentify).start();

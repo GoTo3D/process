@@ -6,7 +6,11 @@
   "scripts": {
     "dev": "node src/processQueue.js",
     "start": "node src/processQueue.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node test/unit/processManager.test.js",
+    "test:unit": "node test/unit/processManager.test.js",
+    "test:integration": "node test/integration/processOnly.test.js",
+    "test:local": "node test/integration/processLocal.test.js",
+    "test:e2e": "node test/e2e/fullProcess.test.js"
   },
   "keywords": [],
   "author": "",

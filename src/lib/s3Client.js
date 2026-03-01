@@ -10,27 +10,38 @@ const {
   CLOUDFLARE_R2_SECRET_ACCESS_KEY,
 } = process.env;
 
+// Validazione credenziali obbligatorie
+if (!CLOUDFLARE_R2_ACCOUNT_ID) {
+  throw new Error('CLOUDFLARE_R2_ACCOUNT_ID environment variable is required');
+}
+if (!CLOUDFLARE_R2_ACCESS_KEY_ID) {
+  throw new Error('CLOUDFLARE_R2_ACCESS_KEY_ID environment variable is required');
+}
+if (!CLOUDFLARE_R2_SECRET_ACCESS_KEY) {
+  throw new Error('CLOUDFLARE_R2_SECRET_ACCESS_KEY environment variable is required');
+}
+
 const s3ClientConfig = {
   region: "auto",
   endpoint: `https://${CLOUDFLARE_R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
   credentials: {
-    accessKeyId: CLOUDFLARE_R2_ACCESS_KEY_ID || "",
-    secretAccessKey: CLOUDFLARE_R2_SECRET_ACCESS_KEY || "",
+    accessKeyId: CLOUDFLARE_R2_ACCESS_KEY_ID,
+    secretAccessKey: CLOUDFLARE_R2_SECRET_ACCESS_KEY,
   },
   tls: {
-    rejectUnauthorized: true, // Verifica del certificato
-    minVersion: 'TLSv1.2' // Forza una versione TLS più recente
+    rejectUnauthorized: true,
+    minVersion: 'TLSv1.2'
   },
   maxAttempts: 5,
   requestTimeout: 60000,
   forcePathStyle: true,
   requestHandler: new https.Agent({
-    connectionTimeout: 5000, // Timeout di connessione
-    socketTimeout: 5000, // Timeout socket
+    connectionTimeout: 5000,
+    socketTimeout: 5000,
     keepAlive: true,
     maxSockets: 50,
-    rejectUnauthorized: false,
-    secureProtocol: 'TLSv1_2_method'
+    rejectUnauthorized: true, // Abilita verifica certificato TLS
+    minVersion: 'TLSv1.2'
   })
 };
 
