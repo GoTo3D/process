@@ -1,17 +1,11 @@
-const bot = require("../lib/telegramClient");
+const bot = require('../lib/telegramClient');
 
-const sendMessage = (user_id, message) => {
-    bot.telegram.sendMessage(user_id, message);
-}
+const sendMessage = async (user_id, message) => {
+  await bot.telegram.sendMessage(user_id, message);
+};
+
 const sendDocument = async (user_id, source) => {
-    try {
-        await bot.telegram.sendDocument(user_id, { source });
-    } catch (error) {
-        throw error
-    }
-}
+  await bot.telegram.sendDocument(user_id, { source });
+};
 
-module.exports = {
-    sendMessage,
-    sendDocument
-}
+module.exports = { sendMessage, sendDocument };

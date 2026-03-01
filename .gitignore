@@ -8,3 +8,5 @@ target
 3d
 projects
 logs
+.DS_Store
+*.log

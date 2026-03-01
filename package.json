@@ -1,32 +1,39 @@
 {
   "name": "config-3d-process",
   "version": "1.0.0",
-  "description": "",
-  "main": "lib/processQueue.js",
+  "description": "3D model processing service via photogrammetry",
+  "main": "src/processQueue.js",
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "scripts": {
-    "dev": "node src/processQueue.js",
+    "dev": "node --env-file=.env src/processQueue.js",
     "start": "node src/processQueue.js",
-    "test": "node test/unit/processManager.test.js",
-    "test:unit": "node test/unit/processManager.test.js",
+    "test": "node --test test/unit/*.test.js",
+    "test:unit": "node --test test/unit/*.test.js",
     "test:integration": "node test/integration/processOnly.test.js",
     "test:local": "node test/integration/processLocal.test.js",
     "test:e2e": "node test/e2e/fullProcess.test.js"
   },
-  "keywords": [],
+  "keywords": [
+    "photogrammetry",
+    "3d-processing"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "@aws-sdk/client-s3": "^3.616.0",
+    "@smithy/node-http-handler": "^4.4.12",
     "@supabase/supabase-js": "^2.43.2",
     "amqplib": "^0.10.3",
-    "fastq": "^1.15.0",
+    "dotenv": "^16.3.1",
     "mime-types": "^2.1.35",
-    "path": "^0.12.7",
+    "p-limit": "^3.1.0",
     "telegraf": "^4.16.3",
-    "undici": "^6.10.1"
+    "undici": "^6.10.1",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
-    "concurrently": "^8.2.2",
-    "dotenv": "^16.3.1"
+    "concurrently": "^8.2.2"
   }
 }

@@ -1,252 +1,274 @@
 /**
  * Unit Tests: ProcessManager
  *
- * Testa i singoli metodi di ProcessManager in isolamento
+ * Testa il comportamento di ProcessManager in isolamento:
+ * - Costruttore e configurazione path
+ * - Rilevamento utente Telegram
+ * - Disk space check
+ * - Cleanup
+ * - Uso di spawn (non exec) per i processi
+ *
+ * NOTA: Questi test importano il modulo reale, quindi richiedono
+ * che le variabili d'ambiente siano configurate (vedi .env.example).
+ * Per test senza env vars, vedi security.test.js e schemas.test.js.
  *
  * ESECUZIONE:
- *   node test/unit/processManager.test.js
+ *   node --test test/unit/processManager.test.js
  */
 
+const { describe, it, before, mock } = require('node:test');
+const assert = require('node:assert/strict');
 const path = require('path');
 const fs = require('fs');
-const dotenv = require('dotenv');
+const os = require('os');
 
-dotenv.config();
+// Imposta env vars minime prima di importare config
+process.env.SUPABASE_URL = process.env.SUPABASE_URL || 'https://test.supabase.co';
+process.env.SUPABASE_KEY = process.env.SUPABASE_KEY || 'test-key';
+process.env.BOT_TOKEN = process.env.BOT_TOKEN || 'test-bot-token';
+process.env.CLOUDFLARE_R2_ACCOUNT_ID = process.env.CLOUDFLARE_R2_ACCOUNT_ID || 'test-account';
+process.env.CLOUDFLARE_R2_ACCESS_KEY_ID = process.env.CLOUDFLARE_R2_ACCESS_KEY_ID || 'test-access-key';
+process.env.CLOUDFLARE_R2_SECRET_ACCESS_KEY = process.env.CLOUDFLARE_R2_SECRET_ACCESS_KEY || 'test-secret';
+process.env.QUEUE_CONNECTION_STRING = process.env.QUEUE_CONNECTION_STRING || 'amqp://localhost';
+process.env.BUCKET = process.env.BUCKET || 'test-bucket';
+// Usa una dir temporanea per i test
+process.env.PROJECTS_BASE_DIR = process.env.PROJECTS_BASE_DIR || os.tmpdir();
 
-// Test runner minimale
-let passed = 0;
-let failed = 0;
-const results = [];
+const ProcessManager = require('../../src/ProcessManager');
+const config = require('../../src/config');
 
-const test = (name, fn) => {
-  results.push({ name, fn });
-};
+// ============================================================
+// Tests: Constructor
+// ============================================================
 
-const runTests = async () => {
-  console.log('\n========================================');
-  console.log('  Unit Tests: ProcessManager');
-  console.log('========================================\n');
+describe('ProcessManager - Constructor', () => {
+  it('imposta i path corretti usando config.PROJECTS_BASE_DIR', () => {
+    const project = {
+      id: 42,
+      status: 'in queue',
+      files: ['photo.jpg'],
+      detail: 'medium',
+      feature: 'normal',
+      order: 'unordered',
+    };
 
-  for (const { name, fn } of results) {
-    try {
-      await fn();
-      console.log(`  [PASS] ${name}`);
-      passed++;
-    } catch (error) {
-      console.log(`  [FAIL] ${name}`);
-      console.log(`         ${error.message}`);
-      failed++;
-    }
-  }
+    const pm = new ProcessManager(42, project);
 
-  console.log('\n----------------------------------------');
-  console.log(`  Results: ${passed} passed, ${failed} failed`);
-  console.log('----------------------------------------\n');
+    const expectedImgDir = path.join(config.PROJECTS_BASE_DIR, '42', 'images');
+    const expectedOutDir = path.join(config.PROJECTS_BASE_DIR, '42', 'model');
 
-  process.exit(failed > 0 ? 1 : 0);
-};
+    assert.equal(pm.imgDir, expectedImgDir);
+    assert.equal(pm.outDir, expectedOutDir);
+  });
 
-// Assert helpers
-const assert = (condition, message) => {
-  if (!condition) throw new Error(message);
-};
+  it('usa path.join (non concatenazione stringa) per i path', () => {
+    const pm = new ProcessManager(123, {
+      files: ['test.jpg'],
+      status: 'in queue',
+    });
 
-const assertEqual = (actual, expected, message) => {
-  if (actual !== expected) {
-    throw new Error(`${message}: expected "${expected}", got "${actual}"`);
-  }
-};
+    // path.join normalizza i separatori, a differenza della concatenazione
+    assert.ok(!pm.imgDir.includes('//'), 'No double slashes in imgDir');
+    assert.ok(!pm.outDir.includes('//'), 'No double slashes in outDir');
+  });
 
-// ============================================
-// Tests
-// ============================================
+  it('converte l\'id a stringa nel path', () => {
+    const pm = new ProcessManager(999, {
+      files: ['test.jpg'],
+      status: 'in queue',
+    });
 
-// Test: sanitizeParam function
-test('sanitizeParam returns valid value from whitelist', () => {
-  // Import the module to access internals
-  // Since sanitizeParam is not exported, we test it indirectly through ProcessManager
-  const ProcessManager = require('../../src/ProcessManager');
+    assert.ok(pm.imgDir.includes('999'));
+    assert.ok(pm.outDir.includes('999'));
+  });
 
-  // Create a mock project with valid params
-  const project = {
-    detail: 'full',
-    ordering: 'sequential',
-    feature: 'high',
-    files: ['test.jpg']
-  };
+  it('inizializza _remoteLocations come array vuoto', () => {
+    const pm = new ProcessManager(1, {
+      files: ['test.jpg'],
+      status: 'in queue',
+    });
 
-  const pm = new ProcessManager(999, project);
-  // The constructor doesn't validate, but processModel does
-  // We can verify the class was created successfully
-  assert(pm.project.detail === 'full', 'Should preserve valid detail');
+    assert.deepEqual(pm._remoteLocations, []);
+  });
 });
 
-test('ProcessManager constructor sets correct paths', () => {
-  const ProcessManager = require('../../src/ProcessManager');
+describe('ProcessManager - Telegram detection', () => {
+  it('isTelegram e\' true quando telegram_user e\' impostato', () => {
+    const pm = new ProcessManager(1, {
+      files: ['test.jpg'],
+      status: 'in queue',
+      telegram_user: 456,
+    });
+    assert.equal(pm.isTelegram, true);
+  });
 
-  const project = {
-    detail: 'medium',
-    ordering: 'unordered',
-    feature: 'normal',
-    files: ['test.jpg'],
-    telegram_user: null
-  };
+  it('isTelegram e\' false quando telegram_user e\' null', () => {
+    const pm = new ProcessManager(1, {
+      files: ['test.jpg'],
+      status: 'in queue',
+      telegram_user: null,
+    });
+    assert.equal(pm.isTelegram, false);
+  });
 
-  const pm = new ProcessManager(123, project);
+  it('isTelegram e\' false quando telegram_user e\' undefined', () => {
+    const pm = new ProcessManager(1, {
+      files: ['test.jpg'],
+      status: 'in queue',
+    });
+    assert.equal(pm.isTelegram, false);
+  });
 
-  assertEqual(pm.imgDir, '/Volumes/T7/projects/123/images/', 'imgDir should be correct');
-  assertEqual(pm.outDir, '/Volumes/T7/projects/123/model/', 'outDir should be correct');
-  assertEqual(pm.isTelegram, false, 'isTelegram should be false when no telegram_user');
+  it('isTelegram e\' false quando telegram_user e\' 0', () => {
+    const pm = new ProcessManager(1, {
+      files: ['test.jpg'],
+      status: 'in queue',
+      telegram_user: 0,
+    });
+    assert.equal(pm.isTelegram, false);
+  });
 });
 
-test('ProcessManager detects Telegram user correctly', () => {
-  const ProcessManager = require('../../src/ProcessManager');
+// ============================================================
+// Tests: Disk space check
+// ============================================================
 
-  const project = {
-    detail: 'medium',
-    files: ['test.jpg'],
-    telegram_user: 456
-  };
+describe('ProcessManager - checkDiskSpace', () => {
+  it('non lancia errore se lo spazio e\' sufficiente', async () => {
+    const pm = new ProcessManager(1, {
+      files: ['test.jpg'],
+      status: 'in queue',
+    });
 
-  const pm = new ProcessManager(123, project);
-  assert(pm.isTelegram === true, 'isTelegram should be true when telegram_user is set');
+    // Usa una directory che esiste sicuramente (tmpdir)
+    // e richiedi poco spazio
+    await assert.doesNotReject(
+      pm.checkDiskSpace(1) // richiede solo 1MB
+    );
+  });
+
+  it('lancia errore se lo spazio richiesto e\' enorme', async () => {
+    const pm = new ProcessManager(1, {
+      files: ['test.jpg'],
+      status: 'in queue',
+    });
+
+    // Richiedi una quantita' impossibile di spazio
+    await assert.rejects(
+      pm.checkDiskSpace(999999999), // ~1 petabyte
+      { message: /Insufficient disk space/ }
+    );
+  });
+
+  it('non lancia errore se la directory non esiste (ENOENT)', async () => {
+    // Sovrascrivi temporaneamente il config
+    const originalBase = config.PROJECTS_BASE_DIR;
+    config.PROJECTS_BASE_DIR = '/nonexistent/path/12345';
+
+    const pm = new ProcessManager(1, {
+      files: ['test.jpg'],
+      status: 'in queue',
+    });
+
+    await assert.doesNotReject(pm.checkDiskSpace(1));
+
+    // Ripristina
+    config.PROJECTS_BASE_DIR = originalBase;
+  });
 });
 
-test('ProcessManager handles undefined telegram_user', () => {
-  const ProcessManager = require('../../src/ProcessManager');
+// ============================================================
+// Tests: cleanupAll
+// ============================================================
 
-  const project = {
-    detail: 'medium',
-    files: ['test.jpg']
-    // telegram_user not set
-  };
+describe('ProcessManager - cleanupAll', () => {
+  it('rimuove sia imgDir che outDir', async () => {
+    const testId = `test-cleanup-${Date.now()}`;
+    const pm = new ProcessManager(testId, {
+      files: ['test.jpg'],
+      status: 'in queue',
+    });
 
-  const pm = new ProcessManager(123, project);
-  assert(pm.isTelegram === false, 'isTelegram should be false when telegram_user is undefined');
+    // Crea le directory
+    await fs.promises.mkdir(pm.imgDir, { recursive: true });
+    await fs.promises.mkdir(pm.outDir, { recursive: true });
+
+    // Verifica che esistano
+    await assert.doesNotReject(fs.promises.access(pm.imgDir));
+    await assert.doesNotReject(fs.promises.access(pm.outDir));
+
+    // Cleanup
+    await pm.cleanupAll();
+
+    // Verifica che siano state rimosse
+    await assert.rejects(fs.promises.access(pm.imgDir));
+    await assert.rejects(fs.promises.access(pm.outDir));
+  });
+
+  it('non lancia errore se le directory non esistono', async () => {
+    const pm = new ProcessManager('nonexistent-99999', {
+      files: ['test.jpg'],
+      status: 'in queue',
+    });
+
+    // Non deve lanciare errore
+    await assert.doesNotReject(pm.cleanupAll());
+  });
 });
 
-// Test: validateProjectId from processQueue
-test('validateProjectId accepts valid integer strings', () => {
-  // We need to test the validation logic
-  const validateProjectId = (rawId) => {
-    if (typeof rawId !== 'string') return null;
-    const trimmed = rawId.trim();
-    if (!/^\d+$/.test(trimmed)) return null;
-    const id = parseInt(trimmed, 10);
-    if (id <= 0 || id > Number.MAX_SAFE_INTEGER) return null;
-    return id;
-  };
+// ============================================================
+// Tests: Factory method (create)
+// ============================================================
 
-  assertEqual(validateProjectId('123'), 123, 'Should parse valid integer');
-  assertEqual(validateProjectId('  456  '), 456, 'Should trim whitespace');
-  assertEqual(validateProjectId('1'), 1, 'Should accept minimum valid id');
+describe('ProcessManager.create', () => {
+  it('e\' un metodo statico', () => {
+    assert.equal(typeof ProcessManager.create, 'function');
+  });
 });
 
-test('validateProjectId rejects invalid inputs', () => {
-  const validateProjectId = (rawId) => {
-    if (typeof rawId !== 'string') return null;
-    const trimmed = rawId.trim();
-    if (!/^\d+$/.test(trimmed)) return null;
-    const id = parseInt(trimmed, 10);
-    if (id <= 0 || id > Number.MAX_SAFE_INTEGER) return null;
-    return id;
-  };
+// ============================================================
+// Tests: Process flow (verifica che spawn sia usato, non exec)
+// ============================================================
 
-  assert(validateProjectId('abc') === null, 'Should reject non-numeric');
-  assert(validateProjectId('') === null, 'Should reject empty string');
-  assert(validateProjectId('0') === null, 'Should reject zero');
-  assert(validateProjectId('-1') === null, 'Should reject negative');
-  assert(validateProjectId('12.34') === null, 'Should reject decimal');
-  assert(validateProjectId('12abc') === null, 'Should reject mixed');
-  assert(validateProjectId(123) === null, 'Should reject non-string');
+describe('ProcessManager - Sicurezza dei processi', () => {
+  it('non importa exec da child_process', () => {
+    const source = fs.readFileSync(
+      path.join(__dirname, '../../src/ProcessManager.js'),
+      'utf8'
+    );
+
+    // Verifica che non venga usato exec (vulnerabile a command injection)
+    assert.ok(
+      !source.includes("require('child_process').exec") &&
+      !source.includes('{ exec }') &&
+      !source.includes("exec("),
+      'ProcessManager should not use exec()'
+    );
+  });
+
+  it('usa spawn da child_process', () => {
+    const source = fs.readFileSync(
+      path.join(__dirname, '../../src/ProcessManager.js'),
+      'utf8'
+    );
+
+    assert.ok(
+      source.includes('spawn'),
+      'ProcessManager should use spawn()'
+    );
+  });
+
+  it('non costruisce comandi shell con template literals', () => {
+    const source = fs.readFileSync(
+      path.join(__dirname, '../../src/ProcessManager.js'),
+      'utf8'
+    );
+
+    // Verifica che non ci siano pattern come: `cd ${x} && ./binary ${y}`
+    const shellConcatPattern = /`[^`]*\$\{[^}]+\}[^`]*&&[^`]*`/;
+    assert.ok(
+      !shellConcatPattern.test(source),
+      'Should not build shell commands with template literals and &&'
+    );
+  });
 });
-
-// Test: sanitizeFilename from s3.js
-test('sanitizeFilename removes path traversal', () => {
-  const sanitizeFilename = (filename) => {
-    if (typeof filename !== 'string') return '';
-    return path.basename(filename).replace(/[^\w\-_.]/g, '_');
-  };
-
-  assertEqual(sanitizeFilename('../../../etc/passwd'), 'passwd', 'Should remove path traversal');
-  assertEqual(sanitizeFilename('test.jpg'), 'test.jpg', 'Should preserve valid filename');
-  assertEqual(sanitizeFilename(''), '', 'Should handle empty string');
-});
-
-test('sanitizeFilename handles special characters', () => {
-  const sanitizeFilename = (filename) => {
-    if (typeof filename !== 'string') return '';
-    return path.basename(filename).replace(/[^\w\-_.]/g, '_');
-  };
-
-  const result = sanitizeFilename('test file (1).jpg');
-  assert(!result.includes(' '), 'Should replace spaces');
-  assert(!result.includes('('), 'Should replace parentheses');
-});
-
-// Test: isValidTelegramUrl from s3.js
-test('isValidTelegramUrl accepts valid Telegram URLs', () => {
-  const ALLOWED_TELEGRAM_HOSTS = ['api.telegram.org', 'telegram.org'];
-
-  const isValidTelegramUrl = (url) => {
-    try {
-      const parsed = new URL(url);
-      return parsed.protocol === 'https:' &&
-        ALLOWED_TELEGRAM_HOSTS.some(host => parsed.hostname.endsWith(host));
-    } catch {
-      return false;
-    }
-  };
-
-  assert(isValidTelegramUrl('https://api.telegram.org/file/bot123/photo.jpg'), 'Should accept api.telegram.org');
-  assert(isValidTelegramUrl('https://telegram.org/something'), 'Should accept telegram.org');
-});
-
-test('isValidTelegramUrl rejects invalid URLs', () => {
-  const ALLOWED_TELEGRAM_HOSTS = ['api.telegram.org', 'telegram.org'];
-
-  const isValidTelegramUrl = (url) => {
-    try {
-      const parsed = new URL(url);
-      return parsed.protocol === 'https:' &&
-        ALLOWED_TELEGRAM_HOSTS.some(host => parsed.hostname.endsWith(host));
-    } catch {
-      return false;
-    }
-  };
-
-  assert(!isValidTelegramUrl('http://api.telegram.org/file'), 'Should reject HTTP');
-  assert(!isValidTelegramUrl('https://evil.com/telegram.org'), 'Should reject non-Telegram domains');
-  assert(!isValidTelegramUrl('https://localhost/file'), 'Should reject localhost');
-  assert(!isValidTelegramUrl('not-a-url'), 'Should reject invalid URL');
-  assert(!isValidTelegramUrl(''), 'Should reject empty string');
-});
-
-// Test: ALLOWED constants
-test('ALLOWED_DETAILS contains all valid detail levels', () => {
-  const ALLOWED_DETAILS = ['preview', 'reduced', 'medium', 'full', 'raw'];
-
-  assert(ALLOWED_DETAILS.includes('preview'), 'Should include preview');
-  assert(ALLOWED_DETAILS.includes('medium'), 'Should include medium');
-  assert(ALLOWED_DETAILS.includes('full'), 'Should include full');
-  assertEqual(ALLOWED_DETAILS.length, 5, 'Should have exactly 5 detail levels');
-});
-
-test('ALLOWED_ORDERINGS contains valid ordering options', () => {
-  const ALLOWED_ORDERINGS = ['unordered', 'sequential'];
-
-  assert(ALLOWED_ORDERINGS.includes('unordered'), 'Should include unordered');
-  assert(ALLOWED_ORDERINGS.includes('sequential'), 'Should include sequential');
-  assertEqual(ALLOWED_ORDERINGS.length, 2, 'Should have exactly 2 ordering options');
-});
-
-test('ALLOWED_FEATURES contains valid feature options', () => {
-  const ALLOWED_FEATURES = ['normal', 'high'];
-
-  assert(ALLOWED_FEATURES.includes('normal'), 'Should include normal');
-  assert(ALLOWED_FEATURES.includes('high'), 'Should include high');
-  assertEqual(ALLOWED_FEATURES.length, 2, 'Should have exactly 2 feature options');
-});
-
-// Run all tests
-runTests();

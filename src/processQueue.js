@@ -1,139 +1,176 @@
-const amqp = require("amqplib/callback_api");
-const ProcessManager = require("./ProcessManager")
-const dotenv = require("dotenv");
+const amqp = require('amqplib');
+const { z } = require('zod');
+const config = require('./config');
+const ProcessManager = require('./ProcessManager');
 
-dotenv.config();
+const QUEUE = config.QUEUE;
 
-const QUEUE_CONNECTION_STRING = process.env.QUEUE_CONNECTION_STRING;
-const QUEUE = process.env.QUEUE || "processing-dev"
-
-// Validazione variabili d'ambiente obbligatorie
-if (!QUEUE_CONNECTION_STRING) {
-  throw new Error('QUEUE_CONNECTION_STRING environment variable is required');
-}
-
-// Riferimenti per graceful shutdown
-let amqpConnection = null;
-let amqpChannel = null;
 let isShuttingDown = false;
+let connection = null;
+let channel = null;
+
+// Schema per il messaggio dalla coda
+// Supporta sia un semplice numero come stringa, sia un JSON con { id }
+const QueueMessageSchema = z.union([
+  z.string().regex(/^\d+$/).transform(Number),
+  z.object({ id: z.number().int().positive() }).transform(obj => obj.id),
+]);
 
 /**
- * Valida l'ID del progetto ricevuto dalla coda
- * @param {string} rawId - ID grezzo dalla coda
- * @returns {number|null} ID validato come numero intero o null se non valido
+ * Parsa e valida il messaggio dalla coda
+ * @param {string} raw
+ * @returns {import('zod').SafeParseReturnType<unknown, number>}
  */
-const validateProjectId = (rawId) => {
-  if (typeof rawId !== 'string') return null;
-
-  const trimmed = rawId.trim();
-  // Verifica che sia un numero intero positivo
-  if (!/^\d+$/.test(trimmed)) return null;
-
-  const id = parseInt(trimmed, 10);
-  // Verifica range ragionevole (previene overflow)
-  if (id <= 0 || id > Number.MAX_SAFE_INTEGER) return null;
-
-  return id;
+const parseQueueMessage = (raw) => {
+  // Tenta il JSON parse solo se sembra un oggetto JSON
+  if (raw.startsWith('{')) {
+    try {
+      return QueueMessageSchema.safeParse(JSON.parse(raw));
+    } catch {
+      // JSON malformato, fallira' la validazione come stringa
+    }
+  }
+  return QueueMessageSchema.safeParse(raw);
 };
 
 /**
  * Gestisce un singolo processo dalla coda
- * @param {string} rawId - ID del progetto da processare (non validato)
+ * @param {number} id
  */
-const handler = async (rawId) => {
-  const id = validateProjectId(rawId);
-
-  if (id === null) {
-    console.error(`Invalid project ID received: ${rawId}`);
-    return;
-  }
-
-  try {
-    // Crea una nuova istanza di ProcessManager per questo progetto
-    const processManager = await ProcessManager.create(id);
-
-    // Esegue il processo completo
-    await processManager.process();
-  } catch (error) {
-    console.error(`Handler error for ID ${id}:`, error);
-  }
+const handler = async (id) => {
+  const processManager = await ProcessManager.create(id);
+  await processManager.process();
 };
 
 /**
- * Graceful shutdown - chiude connessioni AMQP in modo pulito
+ * Connessione AMQP con retry e exponential backoff
+ * @param {number} maxRetries
+ * @returns {Promise<import('amqplib').Connection>}
  */
+async function connectWithRetry(maxRetries = 10) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const conn = await amqp.connect(config.QUEUE_CONNECTION_STRING);
+      console.log('[OK] Connected to AMQP');
+      return conn;
+    } catch (err) {
+      console.error(`AMQP connection attempt ${attempt}/${maxRetries} failed:`, err.message);
+      if (attempt === maxRetries) {
+        throw new Error(`Failed to connect to AMQP after ${maxRetries} attempts`);
+      }
+      const delay = Math.min(1000 * Math.pow(2, attempt), 30000);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+}
+
+/**
+ * Avvia il consumer AMQP
+ */
+async function startConsumer() {
+  connection = await connectWithRetry();
+
+  connection.on('error', (err) => {
+    console.error('[AMQP] Connection error:', err.message);
+  });
+
+  connection.on('close', () => {
+    if (!isShuttingDown) {
+      console.error('[AMQP] Connection closed unexpectedly, reconnecting...');
+      setTimeout(() => startConsumer().catch(err => {
+        console.error('[AMQP] Reconnection failed:', err.message);
+        process.exit(1);
+      }), 5000);
+    }
+  });
+
+  channel = await connection.createChannel();
+  console.log('[OK] Channel created');
+
+  // DLQ per messaggi falliti
+  await channel.assertQueue(`${QUEUE}-dlq`, { durable: true });
+  await channel.assertQueue(QUEUE, {
+    durable: true,
+    arguments: {
+      'x-dead-letter-exchange': '',
+      'x-dead-letter-routing-key': `${QUEUE}-dlq`,
+    }
+  });
+
+  channel.prefetch(1);
+
+  console.log(` [*] Waiting for messages in ${QUEUE}. To exit press CTRL+C`);
+
+  channel.consume(QUEUE, async (msg) => {
+    if (!msg) return;
+
+    if (isShuttingDown) {
+      channel.nack(msg, false, true);
+      return;
+    }
+
+    const content = msg.content.toString();
+    console.log(' [x] Received', content);
+
+    const result = parseQueueMessage(content);
+    if (!result.success) {
+      console.error('Invalid queue message:', result.error.format());
+      channel.ack(msg); // Ack per non ri-processare messaggi malformati
+      return;
+    }
+
+    const id = result.data;
+
+    try {
+      await handler(id);
+      console.log(' [x] Done', id);
+      channel.ack(msg);
+    } catch (error) {
+      console.error(`Processing failed for ID ${id}:`, error.message);
+      // Nack senza requeue: il messaggio va in DLQ
+      channel.nack(msg, false, false);
+    }
+  }, { noAck: false });
+}
+
+// Graceful shutdown con timeout forzato
 const shutdown = async (signal) => {
   if (isShuttingDown) return;
   isShuttingDown = true;
 
   console.log(`\n[${signal}] Shutting down gracefully...`);
 
+  const forceExit = setTimeout(() => {
+    console.error('Shutdown timeout, forcing exit');
+    process.exit(1);
+  }, 10000);
+
   try {
-    if (amqpChannel) {
-      await amqpChannel.close();
-      console.log("[OK] Channel closed");
+    if (channel) {
+      await channel.close();
+      console.log('[OK] Channel closed');
     }
-    if (amqpConnection) {
-      await amqpConnection.close();
-      console.log("[OK] Connection closed");
+    if (connection) {
+      await connection.close();
+      console.log('[OK] Connection closed');
     }
   } catch (error) {
-    console.error("Error during shutdown:", error);
+    console.error('Error during shutdown:', error.message);
   }
 
+  clearTimeout(forceExit);
   process.exit(0);
 };
 
-// Registra handler per segnali di terminazione
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 
-/**
- * Inizializza la connessione AMQP e il consumer della coda
- */
-amqp.connect(
-  QUEUE_CONNECTION_STRING,
-  function (connectionError, connection) {
-    if (connectionError) throw connectionError;
-    amqpConnection = connection;
-    console.log("[OK] Connected to amqp!")
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
 
-    connection.on('error', (err) => {
-      console.error('[AMQP] Connection error:', err.message);
-    });
-
-    connection.on('close', () => {
-      if (!isShuttingDown) {
-        console.error('[AMQP] Connection closed unexpectedly');
-        process.exit(1);
-      }
-    });
-
-    connection.createChannel(function (channelError, channel) {
-      if (channelError) throw channelError;
-      amqpChannel = channel;
-      console.log("[OK] Channel created!")
-
-      channel.assertQueue(QUEUE, { durable: true });
-      console.log(` [*] Waiting for messages in ${QUEUE}. To exit press CTRL+C`);
-
-      channel.prefetch(1);
-
-      channel.consume(
-        QUEUE,
-        async (msg) => {
-          if (isShuttingDown) {
-            // Non processare nuovi messaggi durante lo shutdown
-            channel.nack(msg, false, true);
-            return;
-          }
-          console.log(" [x] Received %s", msg.content.toString());
-          await handler(msg.content.toString());
-          console.log("[x] Done", msg.content.toString());
-          channel.ack(msg);
-        },
-        { noAck: false }
-      );
-    });
-  }
-);
+// Avvio
+startConsumer().catch((err) => {
+  console.error('Failed to start consumer:', err);
+  process.exit(1);
+});

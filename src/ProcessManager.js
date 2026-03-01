@@ -1,23 +1,11 @@
-const fs = require("fs");
-const { exec } = require("child_process");
-const path = require("path");
-const dotenv = require("dotenv");
-const { uploadDir, downloadFiles, downloadFromTelegram } = require("./utils/s3");
-const { getProject, getTelegramUser, updateProject } = require("./utils/db");
-const { sendMessage, sendDocument } = require("./utils/telegram");
-
-dotenv.config();
-
-const time = (who) => {
-  return {
-    start: () => {
-      console.time(`[${who}]`);
-    },
-    end: () => {
-      console.timeEnd(`[${who}]`);
-    }
-  }
-}
+const fs = require('fs');
+const { statfs } = require('fs/promises');
+const { spawn } = require('child_process');
+const path = require('path');
+const config = require('./config');
+const { uploadDir, downloadFiles, downloadFromTelegram, cleanupRemoteFiles } = require('./utils/s3');
+const { getProject, getTelegramUser, updateProject } = require('./utils/db');
+const { sendMessage, sendDocument } = require('./utils/telegram');
 
 // Whitelist per parametri HelloPhotogrammetry (previene Command Injection)
 const ALLOWED_DETAILS = ['preview', 'reduced', 'medium', 'full', 'raw'];
@@ -26,10 +14,10 @@ const ALLOWED_FEATURES = ['normal', 'high'];
 
 /**
  * Valida e sanitizza un parametro contro una whitelist
- * @param {string} value - Valore da validare
- * @param {string[]} allowedValues - Valori permessi
- * @param {string} defaultValue - Valore di default se non valido
- * @returns {string} Valore validato
+ * @param {string} value
+ * @param {string[]} allowedValues
+ * @param {string} defaultValue
+ * @returns {string}
  */
 const sanitizeParam = (value, allowedValues, defaultValue) => {
   if (typeof value !== 'string') return defaultValue;
@@ -37,46 +25,41 @@ const sanitizeParam = (value, allowedValues, defaultValue) => {
   return allowedValues.includes(normalized) ? normalized : defaultValue;
 };
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
+const libDir = path.join(__dirname, '..', 'src', 'lib');
 
-const libDir = path.join(__dirname, "..", "src", "lib");
+// Timeout per i processi
+const PHOTOGRAMMETRY_TIMEOUT = 30 * 60 * 1000; // 30 minuti
+const CONVERSION_TIMEOUT = 5 * 60 * 1000;      // 5 minuti
 
-// Timeout per i comandi exec (30 minuti per photogrammetry, 5 minuti per conversione)
-const PHOTOGRAMMETRY_TIMEOUT = 30 * 60 * 1000;
-const CONVERSION_TIMEOUT = 5 * 60 * 1000;
-
-/**
- * Gestisce il processo di elaborazione di un progetto 3D
- * Include il download dei file, la generazione del modello e l'upload su S3
- */
 class ProcessManager {
   /**
-   * @param {string|number} id - ID del progetto
-   * @param {Object} project - Dati del progetto dal database
+   * @param {string|number} id
+   * @param {Object} project
    */
   constructor(id, project) {
     this.id = id;
     this.project = project;
-    this.imgDir = `/Volumes/T7/projects/${id}/images/`;
-    this.outDir = `/Volumes/T7/projects/${id}/model/`;
+    this.imgDir = path.join(config.PROJECTS_BASE_DIR, `${id}`, 'images');
+    this.outDir = path.join(config.PROJECTS_BASE_DIR, `${id}`, 'model');
     this.isTelegram = !!project.telegram_user;
+    this._remoteLocations = [];
   }
 
   /**
    * Aggiorna lo stato del progetto nel database
-   * @param {string} status - Nuovo stato ('processing', 'done', 'error')
-   * @param {Object} additionalData - Dati aggiuntivi da salvare
+   * @param {string} status
+   * @param {Object} additionalData
    */
   async updateStatus(status, additionalData = {}) {
     const updateObj = {
       status,
       ...(status === 'processing' && { process_start: new Date() }),
-      ...((['done', 'error'].includes(status)) && { process_end: new Date() }),
+      ...(['done', 'error'].includes(status) && { process_end: new Date() }),
       ...additionalData
     };
 
     try {
-      await updateProject(parseInt(this.id), updateObj)
+      await updateProject(parseInt(this.id), updateObj);
     } catch (error) {
       console.error(`Error updating project for ID: ${this.id}:`, error);
       throw error;
@@ -84,271 +67,305 @@ class ProcessManager {
   }
 
   /**
-   * Scarica i file del progetto da Telegram o dal storage
-   * Se i file esistono già localmente, salta il download
-   * @throws {Error} Se non ci sono file da processare
+   * Controlla lo spazio disco disponibile
+   * @param {number} requiredMB
+   */
+  async checkDiskSpace(requiredMB = 500) {
+    try {
+      const stats = await statfs(config.PROJECTS_BASE_DIR);
+      const availableMB = (stats.bavail * stats.bsize) / (1024 * 1024);
+      if (availableMB < requiredMB) {
+        throw new Error(
+          `Insufficient disk space: ${Math.round(availableMB)}MB available, ${requiredMB}MB required`
+        );
+      }
+      console.log(`Disk space OK: ${Math.round(availableMB)}MB available`);
+    } catch (err) {
+      if (err.code === 'ENOENT') {
+        console.warn(`Base directory ${config.PROJECTS_BASE_DIR} not found, skipping disk check`);
+        return;
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Scarica i file del progetto da Telegram o dallo storage.
+   * Non cancella i file remoti (cancellazione differita).
    */
   async downloadProjectFiles() {
     const { files } = this.project;
-    if (!files || files.length === 0) throw new Error("No files to process");
+    if (!files || files.length === 0) throw new Error('No files to process');
 
-    // Verifica se i file esistono già localmente (utile per test con --local)
+    // Verifica se i file esistono gia' localmente
     try {
       const localFiles = await fs.promises.readdir(this.imgDir);
       if (localFiles.length > 0) {
         console.log(`Found ${localFiles.length} local files, skipping download`);
         return;
       }
-    } catch (e) {
+    } catch {
       // Directory non esiste ancora, procedi con il download
     }
 
     if (this.isTelegram) {
       await downloadFromTelegram(this.imgDir, files);
+      this._remoteLocations = [];
     } else {
       try {
-        await downloadFiles(`${this.id}`, files, this.imgDir);
+        const locations = await downloadFiles(`${this.id}`, files, this.imgDir);
+        this._remoteLocations = locations;
       } catch (error) {
-        console.error(`Errore durante il download dei file per il progetto ${this.id}:`, error);
-        // Verifica se la cartella delle immagini esiste e contiene file
+        console.error(`Error downloading files for project ${this.id}:`, error);
+        // Verifica se la cartella ha file parziali
         try {
           const imageFiles = await fs.promises.readdir(this.imgDir);
           if (imageFiles.length === 0) {
-            throw new Error('Nessuna immagine scaricata correttamente');
+            throw new Error('No images downloaded successfully');
           }
-          console.warn(`Download parzialmente completato con ${imageFiles.length} file`);
+          console.warn(`Partial download completed with ${imageFiles.length} files`);
         } catch (e) {
-          throw new Error(`Download fallito completamente: ${error.message}`);
+          if (e.code === 'ENOENT') {
+            throw new Error(`Download failed completely: ${error.message}`);
+          }
+          throw e;
         }
       }
     }
   }
 
   /**
-   * Esegue la generazione del modello 3D usando HelloPhotogrammetry
-   * @returns {Promise<string>} 'ok' se la generazione è avvenuta con successo
-   * @throws {Error} Se la generazione del modello fallisce
+   * Esegue la generazione del modello 3D usando HelloPhotogrammetry (spawn con streaming)
+   * @returns {Promise<string>}
    */
   async processModel() {
-    const _outDir = this.outDir;
-    const _imgDir = this.imgDir;
-
-    // Sanitizza i parametri per prevenire Command Injection
-    // Nota: la colonna nel DB si chiama 'order', non 'ordering'
     const detail = sanitizeParam(this.project.detail, ALLOWED_DETAILS, 'medium');
     const ordering = sanitizeParam(this.project.order, ALLOWED_ORDERINGS, 'unordered');
     const feature = sanitizeParam(this.project.feature, ALLOWED_FEATURES, 'normal');
 
-    const command = `cd ${libDir} && ./HelloPhotogrammetry ${_imgDir} ${_outDir}model.usdz -d ${detail} -o ${ordering} -f ${feature}`;
+    const bin = path.join(libDir, 'HelloPhotogrammetry');
+    const outputPath = path.join(this.outDir, 'model.usdz');
+    const args = [this.imgDir, outputPath, '-d', detail, '-o', ordering, '-f', feature];
 
-    console.log(`Executing command: ${command}`);
+    console.log(`Executing: ${bin} ${args.join(' ')}`);
 
-    return new Promise((res, rej) => {
-      const childProcess = exec(command, { timeout: PHOTOGRAMMETRY_TIMEOUT }, (error, stdout, stderr) => {
-        console.log(`stdout: ${stdout}`);
-        if (error) {
-          console.error(`stderr: ${stderr}`);
-          if (error.killed) {
-            rej(new Error(`Process killed due to timeout (${PHOTOGRAMMETRY_TIMEOUT}ms)`));
-          } else {
-            rej(error);
-          }
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const settle = (fn, value) => {
+        if (!settled) {
+          settled = true;
+          fn(value);
+        }
+      };
+
+      const child = spawn(bin, args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+
+      child.stdout.on('data', (data) => {
+        const lines = data.toString().trim().split('\n');
+        console.log(`[photogrammetry] ${lines[lines.length - 1]}`);
+      });
+
+      child.stderr.on('data', (data) => {
+        console.error(`[photogrammetry:err] ${data.toString().trim()}`);
+      });
+
+      const timer = setTimeout(() => {
+        child.kill('SIGTERM');
+        settle(reject, new Error(`Process killed due to timeout (${PHOTOGRAMMETRY_TIMEOUT}ms)`));
+      }, PHOTOGRAMMETRY_TIMEOUT);
+
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        if (code !== 0) {
+          settle(reject, new Error(`HelloPhotogrammetry exited with code ${code}`));
           return;
         }
         fs.promises
-          .access(`${_outDir}model.usdz`)
-          .then(() => res("ok"))
-          .catch(() => rej(new Error("Output file not found")));
+          .access(outputPath)
+          .then(() => settle(resolve, 'ok'))
+          .catch(() => settle(reject, new Error('Output file not found')));
       });
 
-      childProcess.on('error', (err) => rej(err));
+      child.on('error', (err) => {
+        clearTimeout(timer);
+        settle(reject, err);
+      });
     });
   }
 
   /**
-   * Converte il modello USDZ in altri formati
-   * @returns {Promise<string>} 'ok' se la conversione ha successo
+   * Converte il modello USDZ in altri formati (spawn con streaming)
+   * @returns {Promise<string>}
    */
   async convertModel() {
-    const _modelDir = this.outDir;
-    const command = `cd ${libDir} && ./usdconv ${_modelDir}model.usdz`;
+    const bin = path.join(libDir, 'usdconv');
+    const inputPath = path.join(this.outDir, 'model.usdz');
 
-    return new Promise((res, rej) => {
-      const childProcess = exec(command, { timeout: CONVERSION_TIMEOUT }, (error) => {
-        if (error) {
-          if (error.killed) {
-            rej(new Error(`Conversion killed due to timeout (${CONVERSION_TIMEOUT}ms)`));
-          } else {
-            rej(error);
-          }
-          return;
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const settle = (fn, value) => {
+        if (!settled) {
+          settled = true;
+          fn(value);
         }
-        res("ok");
+      };
+
+      const child = spawn(bin, [inputPath]);
+
+      child.stdout.on('data', (data) => {
+        console.log(`[usdconv] ${data.toString().trim()}`);
       });
 
-      childProcess.on('error', (err) => rej(err));
+      child.stderr.on('data', (data) => {
+        console.error(`[usdconv:err] ${data.toString().trim()}`);
+      });
+
+      const timer = setTimeout(() => {
+        child.kill('SIGTERM');
+        settle(reject, new Error(`Conversion killed due to timeout (${CONVERSION_TIMEOUT}ms)`));
+      }, CONVERSION_TIMEOUT);
+
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        if (code !== 0) {
+          settle(reject, new Error(`usdconv exited with code ${code}`));
+          return;
+        }
+        settle(resolve, 'ok');
+      });
+
+      child.on('error', (err) => {
+        clearTimeout(timer);
+        settle(reject, err);
+      });
     });
   }
 
   /**
-   * Invia notifiche all'utente Telegram con il link al modello
-   * @throws {Error} Se c'è un errore nel recupero dei dati utente
+   * Invia notifiche all'utente Telegram
    */
   async notifyTelegram() {
     if (!this.isTelegram) return;
 
     const data = await getTelegramUser(this.project.telegram_user);
 
-    sendMessage(data.user_id, `Processing done for process ${this.id}`);
+    await sendMessage(data.user_id, `Processing done for process ${this.id}`);
+    await sendMessage(data.user_id, `You can download the model from this link: ${config.SUPABASE_URL}/viewer/${this.id}`);
 
-    sendMessage(data.user_id, `You can download the model from this link: ${SUPABASE_URL}/viewer/${this.id}`);
-
-    const source = path.join(this.outDir, "model.usdz");
+    const source = path.join(this.outDir, 'model.usdz');
     await sendDocument(data.user_id, source);
   }
 
   /**
    * Carica i file del modello su S3
-   * @returns {Promise<Object>} URLs dei file caricati
+   * @returns {Promise<string[]>}
    */
   async uploadToS3() {
-    return await uploadDir({
+    return uploadDir({
       file_location: this.outDir,
       bucket_location: `${this.id}`,
     });
   }
 
   /**
-   * Elimina le immagini originali dopo la generazione del modello
+   * Cleanup completo di tutte le directory locali del progetto
    */
-  async cleanupImages() {
-    await fs.promises.rm(this.imgDir, { recursive: true });
+  async cleanupAll() {
+    const dirs = [this.imgDir, this.outDir];
+    for (const dir of dirs) {
+      try {
+        await fs.promises.rm(dir, { recursive: true, force: true });
+        console.log(`Cleaned up: ${dir}`);
+      } catch (e) {
+        console.warn(`Failed to cleanup ${dir}:`, e.message);
+      }
+    }
   }
 
   /**
    * Esegue l'intero processo di elaborazione
-   * 1. Download dei file
-   * 2. Generazione del modello
-   * 3. Conversione
-   * 4. Upload su S3
-   * 5. Notifiche
-   * @throws {Error} Se qualsiasi fase del processo fallisce
    */
   async process() {
-    let timeIdentify;
+    const startTime = Date.now();
     try {
-      time(this.id).start();
       console.log(`Starting process for ID: ${this.id}`);
-      // Update status to processing
-      console.log(`Updating status to processing for ID: ${this.id}`);
-      timeIdentify = `${this.id}_updateStatus`
-      time(timeIdentify).start();
-      await this.updateStatus('processing');
-      time(timeIdentify).end();
-      console.log(`Status updated to processing for ID: ${this.id}`);
 
-      // Create images folder
-      console.log(`Creating images folder for ID: ${this.id}`);
-      timeIdentify = `${this.id}_createImagesFolder`
-      time(timeIdentify).start();
+      // Check disk space
+      await this.checkDiskSpace();
+
+      // Update status to processing
+      await this.updateStatus('processing');
+
+      // Create directories
       await fs.promises.mkdir(this.imgDir, { recursive: true });
-      time(timeIdentify).end();
-      console.log(`Images folder created for ID: ${this.id}`);
+      await fs.promises.mkdir(this.outDir, { recursive: true });
 
       // Download files
       console.log(`Downloading files for ID: ${this.id}`);
-      timeIdentify = `${this.id}_downloadFiles`
-      time(timeIdentify).start();
       await this.downloadProjectFiles();
-      time(timeIdentify).end();
       console.log(`Files downloaded for ID: ${this.id}`);
-
-      // Create model folder
-      console.log(`Creating model folder for ID: ${this.id}`);
-      timeIdentify = `${this.id}_createModelFolder`
-      time(timeIdentify).start();
-      await fs.promises.mkdir(this.outDir, { recursive: true });
-      time(timeIdentify).end();
-      console.log(`Model folder created for ID: ${this.id}`);
 
       // Process the model
       console.log(`Processing model for ID: ${this.id}`);
-      timeIdentify = `${this.id}_processModel`
-      time(timeIdentify).start();
       await this.processModel();
-      time(timeIdentify).end();
       console.log(`Model processed for ID: ${this.id}`);
-
-      // Delete images
-      console.log(`Cleaning up images for ID: ${this.id}`);
-      timeIdentify = `${this.id}_cleanupImages`
-      time(timeIdentify).start();
-      await this.cleanupImages();
-      time(timeIdentify).end();
-      console.log(`Images cleaned up for ID: ${this.id}`);
 
       // Convert model
       console.log(`Converting model for ID: ${this.id}`);
-      timeIdentify = `${this.id}_convertModel`
-      time(timeIdentify).start();
       await this.convertModel();
-      time(timeIdentify).end();
       console.log(`Model converted for ID: ${this.id}`);
 
       // Upload to S3
       console.log(`Uploading to S3 for ID: ${this.id}`);
-      timeIdentify = `${this.id}_uploadToS3`
-      time(timeIdentify).start();
       const model_urls = await this.uploadToS3();
-      time(timeIdentify).end();
       console.log(`Uploaded to S3 for ID: ${this.id}`);
 
       // Notify Telegram if needed
       if (this.isTelegram) {
         console.log(`Notifying Telegram for ID: ${this.id}`);
-        timeIdentify = `${this.id}_notifyTelegram`
-        time(timeIdentify).start();
         await this.notifyTelegram();
-        time(timeIdentify).end();
         console.log(`Notified Telegram for ID: ${this.id}`);
       }
 
       // Update status to done
-      console.log(`Updating status to done for ID: ${this.id}`);
-      timeIdentify = `${this.id}_updateStatus`
-      time(timeIdentify).start();
       await this.updateStatus('done', { model_urls });
-      time(timeIdentify).end();
-      timeIdentify = null;
-      console.log(`Status updated to done for ID: ${this.id}`);
 
-      console.log(`Processing ${this.id} done`);
-      time(this.id).end();
+      // Cleanup dei file remoti solo dopo successo completo
+      if (this._remoteLocations.length > 0) {
+        await cleanupRemoteFiles(this._remoteLocations);
+      }
+
+      // Cleanup locale
+      await this.cleanupAll();
+
+      const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+      console.log(`Processing ${this.id} done in ${duration}s`);
     } catch (error) {
       console.error(`Error processing ${this.id}:`, error);
-      // cancello il console time generale (id) se si scatena un'eccezione
-      time(this.id).end()
-      // cancello il console time di uno specifico processo che ha scatenato l'eccezione
-      if (timeIdentify) time(timeIdentify).end()
-      await this.updateStatus('error');
+      const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+      console.log(`Processing ${this.id} failed after ${duration}s`);
+
+      await this.updateStatus('error').catch(e =>
+        console.error(`Failed to update error status for ${this.id}:`, e)
+      );
+
+      // Cleanup locale anche in caso di errore
+      await this.cleanupAll();
+
       throw error;
     }
   }
 
   /**
-   * Factory method per creare una nuova istanza di ProcessManager
-   * @param {string|number} id - ID del progetto
-   * @returns {Promise<ProcessManager>} Nuova istanza di ProcessManager
-   * @throws {Error} Se il progetto non viene trovato
+   * Factory method
+   * @param {string|number} id
+   * @returns {Promise<ProcessManager>}
    */
   static async create(id) {
-    try {
-      const project = await getProject(id)
-      return new ProcessManager(id, project);
-    } catch (error) {
-      console.error(`Error creating ProcessManager for ID: ${id}:`, error);
-      throw error;
-    }
+    const project = await getProject(id);
+    return new ProcessManager(id, project);
   }
 }
 
