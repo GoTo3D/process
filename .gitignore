@@ -10,3 +10,5 @@ projects
 logs
 .DS_Store
 *.log
+PhotoProcess/.build
+PhotoProcess/.swiftpm

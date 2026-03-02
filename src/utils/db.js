@@ -12,6 +12,18 @@ const ProjectSchema = z.object({
   process_start: z.string().nullable().optional(),
   process_end: z.string().nullable().optional(),
   model_urls: z.array(z.string()).nullable().optional(),
+  model_dimensions: z.object({
+    dimensions: z.object({
+      width: z.number(),
+      height: z.number(),
+      depth: z.number(),
+    }),
+    bounding_box: z.object({
+      min: z.object({ x: z.number(), y: z.number(), z: z.number() }),
+      max: z.object({ x: z.number(), y: z.number(), z: z.number() }),
+    }),
+    unit: z.string(),
+  }).nullable().optional(),
 }).passthrough();
 
 const TelegramUserSchema = z.object({

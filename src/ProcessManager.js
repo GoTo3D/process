@@ -7,8 +7,8 @@ const { uploadDir, downloadFiles, downloadFromTelegram, cleanupRemoteFiles } = r
 const { getProject, getTelegramUser, updateProject } = require('./utils/db');
 const { sendMessage, sendDocument } = require('./utils/telegram');
 
-// Whitelist per parametri HelloPhotogrammetry (previene Command Injection)
-const ALLOWED_DETAILS = ['preview', 'reduced', 'medium', 'full', 'raw'];
+// Whitelist per parametri PhotoProcess (previene Command Injection)
+const ALLOWED_DETAILS = ['preview', 'reduced', 'medium', 'full', 'raw', 'custom'];
 const ALLOWED_ORDERINGS = ['unordered', 'sequential'];
 const ALLOWED_FEATURES = ['normal', 'high'];
 
@@ -25,11 +25,10 @@ const sanitizeParam = (value, allowedValues, defaultValue) => {
   return allowedValues.includes(normalized) ? normalized : defaultValue;
 };
 
-const libDir = path.join(__dirname, '..', 'src', 'lib');
+const libDir = path.join(__dirname, 'lib');
 
-// Timeout per i processi
+// Timeout per il processo di fotogrammetria
 const PHOTOGRAMMETRY_TIMEOUT = 30 * 60 * 1000; // 30 minuti
-const CONVERSION_TIMEOUT = 5 * 60 * 1000;      // 5 minuti
 
 class ProcessManager {
   /**
@@ -43,6 +42,7 @@ class ProcessManager {
     this.outDir = path.join(config.PROJECTS_BASE_DIR, `${id}`, 'model');
     this.isTelegram = !!project.telegram_user;
     this._remoteLocations = [];
+    this._modelDimensions = null;
   }
 
   /**
@@ -135,17 +135,32 @@ class ProcessManager {
   }
 
   /**
-   * Esegue la generazione del modello 3D usando HelloPhotogrammetry (spawn con streaming)
+   * Esegue la generazione del modello 3D e la conversione in OBJ usando PhotoProcess
    * @returns {Promise<string>}
    */
-  async processModel() {
+  async processAndConvert() {
     const detail = sanitizeParam(this.project.detail, ALLOWED_DETAILS, 'medium');
     const ordering = sanitizeParam(this.project.order, ALLOWED_ORDERINGS, 'unordered');
     const feature = sanitizeParam(this.project.feature, ALLOWED_FEATURES, 'normal');
 
-    const bin = path.join(libDir, 'HelloPhotogrammetry');
-    const outputPath = path.join(this.outDir, 'model.usdz');
-    const args = [this.imgDir, outputPath, '-d', detail, '-o', ordering, '-f', feature];
+    const bin = path.join(libDir, 'PhotoProcess');
+    const args = [
+      this.imgDir,
+      this.outDir,
+      '--detail', detail,
+      '--ordering', ordering,
+      '--feature-sensitivity', feature
+    ];
+
+    // CR-16: Pass custom detail parameters if present
+    if (detail === 'custom') {
+      const { max_polygons, texture_dimension, texture_format, texture_quality, texture_maps } = this.project;
+      if (max_polygons) args.push('--max-polygons', String(max_polygons));
+      if (texture_dimension) args.push('--texture-dimension', String(texture_dimension));
+      if (texture_format) args.push('--texture-format', String(texture_format));
+      if (texture_quality != null) args.push('--texture-quality', String(texture_quality));
+      if (texture_maps) args.push('--texture-maps', String(texture_maps));
+    }
 
     console.log(`Executing: ${bin} ${args.join(' ')}`);
 
@@ -164,11 +179,50 @@ class ProcessManager {
 
       child.stdout.on('data', (data) => {
         const lines = data.toString().trim().split('\n');
-        console.log(`[photogrammetry] ${lines[lines.length - 1]}`);
+        for (const line of lines) {
+          try {
+            const event = JSON.parse(line);
+            switch (event.type) {
+              case 'progress': {
+                const pct = (event.fraction * 100).toFixed(1);
+                const stage = event.stage || '';
+                const eta = event.eta_seconds
+                  ? ` (ETA: ${Math.round(event.eta_seconds)}s)`
+                  : '';
+                console.log(`[photoprocess:${event.request}] ${pct}% ${stage}${eta}`);
+                break;
+              }
+              case 'complete':
+                console.log(`[photoprocess] ${event.request} complete: ${event.output_path}`);
+                break;
+              case 'error':
+                console.error(`[photoprocess:error] ${event.request}: ${event.message}`);
+                break;
+              case 'invalid_sample':
+                console.warn(`[photoprocess] Invalid sample #${event.sample_id}: ${event.reason}`);
+                break;
+              case 'skipped_sample':
+                console.warn(`[photoprocess] Skipped sample #${event.sample_id}`);
+                break;
+              case 'model_info':
+                this._modelDimensions = {
+                  dimensions: event.dimensions,
+                  bounding_box: event.bounding_box,
+                  unit: event.unit,
+                };
+                console.log(`[photoprocess] Model dimensions: ${event.dimensions.width}x${event.dimensions.height}x${event.dimensions.depth} ${event.unit}`);
+                break;
+              default:
+                console.log(`[photoprocess] ${event.type}`);
+            }
+          } catch {
+            console.log(`[photoprocess] ${line}`);
+          }
+        }
       });
 
       child.stderr.on('data', (data) => {
-        console.error(`[photogrammetry:err] ${data.toString().trim()}`);
+        console.error(`[photoprocess:err] ${data.toString().trim()}`);
       });
 
       const timer = setTimeout(() => {
@@ -179,61 +233,14 @@ class ProcessManager {
       child.on('close', (code) => {
         clearTimeout(timer);
         if (code !== 0) {
-          settle(reject, new Error(`HelloPhotogrammetry exited with code ${code}`));
+          settle(reject, new Error(`PhotoProcess exited with code ${code}`));
           return;
         }
+        const outputPath = path.join(this.outDir, 'model.usdz');
         fs.promises
           .access(outputPath)
           .then(() => settle(resolve, 'ok'))
           .catch(() => settle(reject, new Error('Output file not found')));
-      });
-
-      child.on('error', (err) => {
-        clearTimeout(timer);
-        settle(reject, err);
-      });
-    });
-  }
-
-  /**
-   * Converte il modello USDZ in altri formati (spawn con streaming)
-   * @returns {Promise<string>}
-   */
-  async convertModel() {
-    const bin = path.join(libDir, 'usdconv');
-    const inputPath = path.join(this.outDir, 'model.usdz');
-
-    return new Promise((resolve, reject) => {
-      let settled = false;
-      const settle = (fn, value) => {
-        if (!settled) {
-          settled = true;
-          fn(value);
-        }
-      };
-
-      const child = spawn(bin, [inputPath]);
-
-      child.stdout.on('data', (data) => {
-        console.log(`[usdconv] ${data.toString().trim()}`);
-      });
-
-      child.stderr.on('data', (data) => {
-        console.error(`[usdconv:err] ${data.toString().trim()}`);
-      });
-
-      const timer = setTimeout(() => {
-        child.kill('SIGTERM');
-        settle(reject, new Error(`Conversion killed due to timeout (${CONVERSION_TIMEOUT}ms)`));
-      }, CONVERSION_TIMEOUT);
-
-      child.on('close', (code) => {
-        clearTimeout(timer);
-        if (code !== 0) {
-          settle(reject, new Error(`usdconv exited with code ${code}`));
-          return;
-        }
-        settle(resolve, 'ok');
       });
 
       child.on('error', (err) => {
@@ -307,15 +314,10 @@ class ProcessManager {
       await this.downloadProjectFiles();
       console.log(`Files downloaded for ID: ${this.id}`);
 
-      // Process the model
+      // Process the model (USDZ + OBJ in a single step)
       console.log(`Processing model for ID: ${this.id}`);
-      await this.processModel();
+      await this.processAndConvert();
       console.log(`Model processed for ID: ${this.id}`);
-
-      // Convert model
-      console.log(`Converting model for ID: ${this.id}`);
-      await this.convertModel();
-      console.log(`Model converted for ID: ${this.id}`);
 
       // Upload to S3
       console.log(`Uploading to S3 for ID: ${this.id}`);
@@ -330,7 +332,9 @@ class ProcessManager {
       }
 
       // Update status to done
-      await this.updateStatus('done', { model_urls });
+      const doneData = { model_urls };
+      if (this._modelDimensions) doneData.model_dimensions = this._modelDimensions;
+      await this.updateStatus('done', doneData);
 
       // Cleanup dei file remoti solo dopo successo completo
       if (this._remoteLocations.length > 0) {

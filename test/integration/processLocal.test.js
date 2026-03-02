@@ -66,24 +66,48 @@ async function runLocalTest() {
     await fs.promises.mkdir(outDir, { recursive: true });
     console.log('  -> Output directory ready');
 
-    // Step 3: Esegui HelloPhotogrammetry
-    console.log('\n[Step 3/4] Running HelloPhotogrammetry...');
+    // Step 3: Esegui PhotoProcess
+    console.log('\n[Step 3/4] Running PhotoProcess...');
     console.log('  This may take several minutes...\n');
 
-    const { exec } = require('child_process');
+    const { spawn } = require('child_process');
     const libDir = path.join(__dirname, '../../src/lib');
 
-    const command = `cd ${libDir} && ./HelloPhotogrammetry ${imgDir} ${outDir}model.usdz -d preview -o unordered -f normal`;
-    console.log(`  Command: ${command}\n`);
+    const bin = path.join(libDir, 'PhotoProcess');
+    const processArgs = [imgDir, outDir, '--detail', 'preview', '--ordering', 'unordered', '--feature-sensitivity', 'normal'];
+    console.log(`  Command: ${bin} ${processArgs.join(' ')}\n`);
 
     const startTime = Date.now();
 
     await new Promise((resolve, reject) => {
-      const childProcess = exec(command, { timeout: 30 * 60 * 1000 }, (error, stdout, stderr) => {
-        if (stdout) console.log('  stdout:', stdout.substring(0, 500));
-        if (error) {
-          console.error('  stderr:', stderr);
-          reject(error);
+      const childProcess = spawn(bin, processArgs, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+
+      childProcess.stdout.on('data', (data) => {
+        const lines = data.toString().trim().split('\n');
+        for (const line of lines) {
+          try {
+            const event = JSON.parse(line);
+            if (event.type === 'progress') {
+              const pct = (event.fraction * 100).toFixed(1);
+              console.log(`  [${event.request}] ${pct}% ${event.stage || ''}`);
+            } else {
+              console.log(`  [${event.type}] ${JSON.stringify(event)}`);
+            }
+          } catch {
+            console.log(`  ${line}`);
+          }
+        }
+      });
+
+      childProcess.stderr.on('data', (data) => {
+        console.error(`  [stderr] ${data.toString().trim()}`);
+      });
+
+      childProcess.on('close', (code) => {
+        if (code !== 0) {
+          reject(new Error(`PhotoProcess exited with code ${code}`));
           return;
         }
         resolve();
@@ -110,23 +134,11 @@ async function runLocalTest() {
       console.log(`  - USDZ size: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
     }
 
-    // Opzionale: esegui conversione
+    // Verifica file OBJ (generati direttamente da PhotoProcess)
     if (hasUsdz) {
-      console.log('\n  Running usdconv...');
-      const convCommand = `cd ${libDir} && ./usdconv ${outDir}model.usdz`;
-
-      await new Promise((resolve, reject) => {
-        exec(convCommand, { timeout: 5 * 60 * 1000 }, (error) => {
-          if (error) {
-            console.warn('  -> Conversion failed (non-critical):', error.message);
-            resolve(); // Non fallire per conversione
-            return;
-          }
-          resolve();
-        });
-      });
-
       const finalFiles = await fs.promises.readdir(outDir);
+      const hasObj = finalFiles.some(f => f.endsWith('.obj'));
+      console.log(`  - Has OBJ: ${hasObj}`);
       console.log(`  - Final files: ${finalFiles.join(', ')}`);
     }
 
