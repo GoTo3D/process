@@ -28,7 +28,7 @@ bash PhotoProcess/build.sh  # Build and deploy Swift binary
 `src/processQueue.js` → AMQP consumer that receives project IDs from the queue and delegates to ProcessManager.
 
 `src/ProcessManager.js` → Main orchestrator class that handles the complete workflow:
-1. Download images from Supabase storage or Telegram
+1. Download images from Cloudflare R2 or Telegram
 2. Execute `PhotoProcess` binary (images → USDZ + OBJ in a single step)
 3. Upload results to Cloudflare R2
 4. Send Telegram notifications (if applicable)
@@ -43,8 +43,8 @@ bash PhotoProcess/build.sh  # Build and deploy Swift binary
 
 ### External Services
 
-- **Supabase** - Database (project metadata) and storage (source images)
-- **Cloudflare R2** - Output storage for generated 3D models (S3-compatible)
+- **Supabase** - Database (project metadata)
+- **Cloudflare R2** - Storage for source images and generated 3D models (S3-compatible)
 - **RabbitMQ** - Job queue for processing requests
 - **Telegram** - User notifications and optional file source
 

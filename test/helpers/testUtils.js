@@ -6,11 +6,13 @@ const path = require('path');
 const dotenv = require('dotenv');
 const { supabase } = require('../../src/lib/supabaseClient');
 const { supabaseAdmin } = require('./supabaseAdmin');
+const { putObject, deleteObject, listObjects } = require('../../src/lib/s3Api');
 
 dotenv.config();
 
 const SAMPLE_IMAGES_PATH = '/Volumes/T7/sample';
 const BUCKET = process.env.BUCKET;
+console.log(`Using bucket: ${BUCKET}`);
 
 /**
  * Ottiene il client Supabase appropriato (admin se disponibile, altrimenti normale)
@@ -94,7 +96,7 @@ const getProjectStatus = async (id) => {
 };
 
 /**
- * Carica le immagini di esempio su Supabase storage
+ * Carica le immagini di esempio su Cloudflare R2
  * @param {number} projectId - ID del progetto
  * @param {number} maxFiles - Numero massimo di file da caricare (default: 5)
  * @returns {Promise<string[]>} Array di nomi file caricati
@@ -111,18 +113,12 @@ const uploadSampleImages = async (projectId, maxFiles = 5) => {
     const fileBuffer = fs.readFileSync(filePath);
     const storagePath = `${projectId}/images/${fileName}`;
 
-    const { error } = await supabase.storage
-      .from(BUCKET)
-      .upload(storagePath, fileBuffer, {
-        contentType: 'image/heic',
-        upsert: true
-      });
-
-    if (error) {
-      console.error(`Error uploading ${fileName}:`, error);
-    } else {
+    try {
+      await putObject(BUCKET, storagePath, fileBuffer);
       uploadedFiles.push(fileName);
       console.log(`Uploaded: ${fileName}`);
+    } catch (error) {
+      console.error(`Error uploading ${fileName}:`, error);
     }
   }
 
@@ -130,29 +126,21 @@ const uploadSampleImages = async (projectId, maxFiles = 5) => {
 };
 
 /**
- * Pulisce i file di storage per un progetto
+ * Pulisce i file di storage per un progetto su Cloudflare R2
  * @param {number} projectId - ID del progetto
  */
 const cleanupStorage = async (projectId) => {
   try {
-    // Lista file immagini
-    const { data: imageFiles } = await supabase.storage
-      .from(BUCKET)
-      .list(`${projectId}/images`);
-
-    if (imageFiles && imageFiles.length > 0) {
-      const imagePaths = imageFiles.map(f => `${projectId}/images/${f.name}`);
-      await supabase.storage.from(BUCKET).remove(imagePaths);
+    // Lista e cancella file immagini
+    const imageKeys = await listObjects(BUCKET, `${projectId}/images/`);
+    for (const key of imageKeys) {
+      await deleteObject(BUCKET, key);
     }
 
-    // Lista file modelli
-    const { data: modelFiles } = await supabase.storage
-      .from(BUCKET)
-      .list(`${projectId}/model`);
-
-    if (modelFiles && modelFiles.length > 0) {
-      const modelPaths = modelFiles.map(f => `${projectId}/model/${f.name}`);
-      await supabase.storage.from(BUCKET).remove(modelPaths);
+    // Lista e cancella file modelli
+    const modelKeys = await listObjects(BUCKET, `${projectId}/model/`);
+    for (const key of modelKeys) {
+      await deleteObject(BUCKET, key);
     }
   } catch (error) {
     console.error('Error cleaning up storage:', error);

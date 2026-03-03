@@ -2,6 +2,7 @@ const {
   GetObjectCommand,
   PutObjectCommand,
   DeleteObjectCommand,
+  ListObjectsV2Command,
 } = require('@aws-sdk/client-s3');
 
 const clientS3 = require('./s3Client');
@@ -33,4 +34,9 @@ const deleteObject = async (Bucket, Key) => {
   return clientS3.send(new DeleteObjectCommand({ Bucket, Key }));
 };
 
-module.exports = { getObject, putObject, deleteObject };
+const listObjects = async (Bucket, Prefix) => {
+  const response = await clientS3.send(new ListObjectsV2Command({ Bucket, Prefix }));
+  return (response.Contents || []).map(obj => obj.Key);
+};
+
+module.exports = { getObject, putObject, deleteObject, listObjects };

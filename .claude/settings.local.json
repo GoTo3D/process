@@ -10,11 +10,12 @@
       "WebFetch(domain:github.com)",
       "WebFetch(domain:swiftrocks.com)",
       "WebFetch(domain:gist.github.com)",
-      "Bash(swift:*)"
+      "Bash(swift:*)",
+      "Bash(npm run test:unit)"
     ]
   },
+  "enableAllProjectMcpServers": true,
   "enabledMcpjsonServers": [
     "supabase"
-  ],
-  "enableAllProjectMcpServers": true
+  ]
 }
