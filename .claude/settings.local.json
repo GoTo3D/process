@@ -11,7 +11,11 @@
       "WebFetch(domain:swiftrocks.com)",
       "WebFetch(domain:gist.github.com)",
       "Bash(swift:*)",
-      "Bash(npm run test:unit)"
+      "Bash(npm run test:unit)",
+      "WebFetch(domain:developer.hyper3d.ai)",
+      "WebFetch(domain:docs.meshy.ai)",
+      "WebFetch(domain:platform.tripo3d.ai)",
+      "WebFetch(domain:www.tripo3d.ai)"
     ]
   },
   "enableAllProjectMcpServers": true,
